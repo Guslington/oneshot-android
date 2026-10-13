@@ -1,0 +1,30 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+.DS_Store
+
+# Machine-specific SDK path
+local.properties
+
+# Generated / captured
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+
+# Signing material and identities (secrets)
+*.jks
+*.keystore
+*.identity
+
+# Kotlin
+.kotlin/
+
+# Pi agent
+.pi/
