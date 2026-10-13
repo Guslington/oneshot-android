@@ -59,6 +59,15 @@ class Storage(context: Context) {
         get() = prefs.getBoolean(KEY_INCOGNITO, false)
         set(value) = prefs.edit().putBoolean(KEY_INCOGNITO, value).apply()
 
+    var backgroundNotifications: Boolean
+        get() = prefs.getBoolean(KEY_BG_NOTIFS, false)
+        set(value) = prefs.edit().putBoolean(KEY_BG_NOTIFS, value).apply()
+
+    /** Cursor of the last mention the user has seen (see the mentions feed). */
+    var mentionsSeenCursor: String?
+        get() = prefs.getString(KEY_MENTIONS_SEEN, null)
+        set(value) = prefs.edit().putString(KEY_MENTIONS_SEEN, value).apply()
+
     // ---- Remembered rooms ------------------------------------------------------
 
     fun rememberRoom(name: String, fingerprint: String) {
@@ -100,6 +109,8 @@ class Storage(context: Context) {
         private const val KEY_CLIENT_URL = "client_url"
         private const val KEY_INCOGNITO = "incognito"
         private const val KEY_CONTACTS = "contacts"
+        private const val KEY_BG_NOTIFS = "bg_notifications"
+        private const val KEY_MENTIONS_SEEN = "mentions_seen_cursor"
         private fun roomKey(name: String) = "room_fp_$name"
     }
 }

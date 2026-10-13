@@ -43,7 +43,7 @@ class ChatRepository(
     private var heartbeatJob: Job? = null
 
     private val clientMeta = ClientMeta(
-        name = "oneshot-android",
+        name = "oshi",
         version = "0.1.0",
         url = storage.clientUrl,
     )

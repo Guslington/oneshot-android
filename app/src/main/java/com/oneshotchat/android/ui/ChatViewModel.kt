@@ -1,19 +1,26 @@
 package com.oneshotchat.android.ui
 
 import android.app.Application
+import android.content.Intent
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.oneshotchat.android.crypto.Identity
 import com.oneshotchat.android.crypto.Mentions
+import com.oneshotchat.android.crypto.SideRoom
 import com.oneshotchat.android.crypto.Tripcode
 import com.oneshotchat.android.data.ChatRepository
 import com.oneshotchat.android.data.Storage
 import com.oneshotchat.android.net.ApiException
+import com.oneshotchat.android.net.CreateSettings
 import com.oneshotchat.android.net.EventSocket
 import com.oneshotchat.android.net.JoinRequest
+import com.oneshotchat.android.net.Mention
 import com.oneshotchat.android.net.Message
 import com.oneshotchat.android.net.Occupant
+import com.oneshotchat.android.net.RoleEntry
 import com.oneshotchat.android.net.Room
+import com.oneshotchat.android.notify.MentionService
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -46,7 +53,13 @@ data class RoomView(
     val labels: Map<String, String>,
     val admins: Set<String>,
     val notices: List<String>,
+    /** True for room operators and server admins. */
+    val canOperate: Boolean,
+    val me: String?,
 )
+
+/** Asks the user for a room key or invite code, then retries the join. */
+data class CredentialPrompt(val name: String, val kind: String, val retry: Boolean)
 
 /** A candidate for the mention autocomplete. */
 data class MentionCandidate(val fingerprint: String, val name: String, val label: String)
@@ -72,6 +85,30 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _toast = MutableStateFlow<String?>(null)
     val toast: StateFlow<String?> = _toast.asStateFlow()
+
+    private val _prompt = MutableStateFlow<CredentialPrompt?>(null)
+    val prompt: StateFlow<CredentialPrompt?> = _prompt.asStateFlow()
+
+    private val _mentions = MutableStateFlow<List<Mention>>(emptyList())
+    val mentions: StateFlow<List<Mention>> = _mentions.asStateFlow()
+
+    private val _mentionsLoading = MutableStateFlow(false)
+    val mentionsLoading: StateFlow<Boolean> = _mentionsLoading.asStateFlow()
+
+    private val _unreadMentions = MutableStateFlow(0)
+    val unreadMentions: StateFlow<Int> = _unreadMentions.asStateFlow()
+
+    private val _backgroundNotifications = MutableStateFlow(storage.backgroundNotifications)
+    val backgroundNotifications: StateFlow<Boolean> = _backgroundNotifications.asStateFlow()
+
+    /** Set when a side-room notification is tapped: show the mentions feed, don't join. */
+    private val _showMentionsRequest = MutableStateFlow(false)
+    val showMentionsRequest: StateFlow<Boolean> = _showMentionsRequest.asStateFlow()
+    fun requestMentions() { _showMentionsRequest.value = true }
+    fun mentionsRequestHandled() { _showMentionsRequest.value = false }
+
+    /** A room to open as soon as login finishes (e.g. from a notification tap). */
+    private var pendingRoom: String? = null
 
     val serverOrigin: String get() = repo?.serverOrigin ?: storage.serverBaseUrl
     val myFingerprint: String? get() = repo?.identity?.fingerprint
@@ -114,6 +151,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             collectSocket(repository)
             _phase.value = AppPhase.Ready(info.id, info.name ?: storage.displayName)
             refreshRooms()
+            pollUnread()
+            updateService()
+            pendingRoom?.let { pendingRoom = null; joinByName(it) }
         } catch (e: ApiException) {
             _phase.value = AppPhase.Error("Login failed: ${e.code} — ${e.message}")
         } catch (e: Exception) {
@@ -132,6 +172,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         val who = frame.mention.message.author.name ?: "someone"
                         val room = frame.mention.room?.name?.let { "#$it" } ?: "a room"
                         toast("Mentioned by $who in $room")
+                        pollUnread()
                     }
                     is EventSocket.Frame.SessionNotice -> {
                         if (frame.code == "session_expired") reLogin()
@@ -146,10 +187,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- Identity management ---------------------------------------------------
 
-    fun createIdentity(name: String?) {
+    fun createIdentity(name: String?, incognito: Boolean) {
         viewModelScope.launch {
             val identity = Identity.generate(name?.ifBlank { null })
             storage.saveIdentity(identity)
+            storage.incognito = incognito
             storage.displayName = name?.ifBlank { null }
             startSession(identity)
         }
@@ -177,6 +219,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             if (forget) storage.clearIdentity()
             closeRoomInternal()
             repo = null
+            updateService()
+            _unreadMentions.value = 0
+            _mentions.value = emptyList()
             _phase.value = AppPhase.NeedsIdentity
         }
     }
@@ -204,23 +249,43 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- Open / join a room ----------------------------------------------------
 
-    fun joinByName(name: String) {
+    /**
+     * Join (or create) a room. [key] / [invite] answer a [CredentialPrompt]; [create]
+     * only applies if the name is free and this call creates the room.
+     */
+    fun joinByName(
+        name: String,
+        key: String? = null,
+        invite: String? = null,
+        create: CreateSettings? = null,
+    ) {
         val repository = repo ?: return
         viewModelScope.launch {
             try {
                 val expect = storage.rememberedRoom(name)
                 val resp = try {
-                    repository.api.join(JoinRequest(name = name, expect = expect))
+                    repository.api.join(JoinRequest(name, expect, key, invite, create))
                 } catch (e: ApiException) {
                     if (e.code == "room_changed") {
                         toast("#$name now points to a different room than before.")
-                        repository.api.join(JoinRequest(name = name))
+                        repository.api.join(JoinRequest(name = name, key = key, invite = invite, create = create))
                     } else throw e
+                }
+                _prompt.value = null
+                if (!properSide(resp.room)) {
+                    runCatching { repository.api.leave(resp.room.id) }
+                    toast("This isn't a proper side room, so I left.")
+                    return@launch
                 }
                 storage.rememberRoom(name, resp.room.id)
                 openRoom(resp.room, resp.role)
             } catch (e: ApiException) {
-                toast("Join failed: ${e.code} — ${e.message}")
+                when (e.code) {
+                    "key_required" -> _prompt.value = CredentialPrompt(name, "key", retry = key != null)
+                    "invite_required" -> _prompt.value = CredentialPrompt(name, "invite", retry = invite != null)
+                    "banned" -> toast("You're banned from #$name.")
+                    else -> toast("Join failed: ${e.code} — ${e.message}")
+                }
             } catch (e: Exception) {
                 toast("Join failed: ${e.message}")
             }
@@ -288,7 +353,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 more = page.hasMore
             }
         } catch (e: ApiException) {
-            if (e.code == "not_in_room") rejoinActive()
+            when (e.code) {
+                "not_in_room" -> rejoinActive()
+                "room_not_found" -> {
+                    // Closed (side rooms can be closed by either person) or expired.
+                    toast("That room is gone.")
+                    closeRoom()
+                }
+            }
         } catch (_: Exception) { /* transient; next poll retries */ }
     }
 
@@ -328,6 +400,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 "member.role_changed" -> data?.str("identity")?.let { id ->
                     val role = data.str("role")
                     occ[id] = (occ[id] ?: Occupant(id)).copy(role = role)
+                    if (id == myFingerprint) currentRole = role
                 }
                 "room.updated" -> decodeRoom(data)?.let { currentRoom = it }
                 "notice" -> data?.str("text")?.let { notices.add(it) }
@@ -378,7 +451,291 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             labels = Tripcode.labels(people),
             admins = admins,
             notices = notices.toList(),
+            canOperate = currentRole == "operator" || (myFingerprint != null && myFingerprint in admins),
+            me = myFingerprint,
         )
+    }
+
+    // ---- Credentials, deep links, background service ---------------------------
+
+    fun dismissPrompt() { _prompt.value = null }
+
+    /** Open a room by name once logged in (used when a notification is tapped). */
+    fun openRoomByName(name: String) {
+        if (_phase.value is AppPhase.Ready) joinByName(name) else pendingRoom = name
+    }
+
+    fun setBackgroundNotifications(enabled: Boolean) {
+        storage.backgroundNotifications = enabled
+        _backgroundNotifications.value = enabled
+        updateService()
+    }
+
+    private fun updateService() {
+        val ctx = getApplication<Application>()
+        val intent = Intent(ctx, MentionService::class.java)
+        runCatching {
+            if (storage.backgroundNotifications && repo != null) ContextCompat.startForegroundService(ctx, intent)
+            else ctx.stopService(intent)
+        }
+    }
+
+    // ---- Side rooms ------------------------------------------------------------
+
+    /**
+     * A room that claims to be a side room must have exactly two members, include us, and
+     * carry the name derived from those two fingerprints. Ordinary rooms pass.
+     */
+    private fun properSide(room: Room): Boolean {
+        val side = room.side ?: return true
+        val me = myFingerprint ?: return false
+        val m = side.members
+        if (m.size != 2 || me !in m) return false
+        return room.name == SideRoom.name(serverOrigin, m[0], m[1])
+    }
+
+    /** If [mention] is a side room opened by a saved contact, return that contact. */
+    fun sideRoomContact(mention: Mention): Storage.Contact? {
+        val me = myFingerprint ?: return null
+        val roomName = mention.room?.name ?: return null
+        val author = mention.message.author.identity
+        if (author == me) return null
+        val contact = storage.contacts().firstOrNull { it.fingerprint == author } ?: return null
+        return contact.takeIf { roomName == SideRoom.name(serverOrigin, me, author) }
+    }
+
+    /**
+     * Open a side room with [other] by sending a first message. Only creates the room once
+     * there is something to say, so no empty rooms nobody was told about.
+     */
+    fun startSideRoom(other: String, body: String, mention: Boolean) {
+        val repository = repo ?: return
+        val me = myFingerprint ?: return
+        if (body.isBlank()) return
+        viewModelScope.launch {
+            try {
+                val name = SideRoom.name(serverOrigin, me, other)
+                val resp = repository.api.join(
+                    JoinRequest(
+                        name = name,
+                        create = CreateSettings(sideWith = other, retentionSeconds = 604_800),
+                    ),
+                )
+                val members = resp.room.side?.members?.toSet()
+                if (members != setOf(me, other) || !properSide(resp.room)) {
+                    runCatching { repository.api.leave(resp.room.id) }
+                    toast("This isn't a proper side room, so I left.")
+                    return@launch
+                }
+                storage.rememberRoom(name, resp.room.id)
+                openRoom(resp.room, resp.role)
+                val text = (if (mention) Mentions.token(other) + " " else "") + body.trim()
+                val msg = repository.sendMessage(resp.room.id, text, sign = false)
+                roomLock.withLock {
+                    msgs[msg.id] = msg
+                    processedSeq = maxOf(processedSeq, msg.id)
+                    publish()
+                }
+            } catch (e: ApiException) {
+                toast("Side room failed: ${e.code} — ${e.message}")
+            } catch (e: Exception) {
+                toast("Side room failed: ${e.message}")
+            }
+        }
+    }
+
+    /** Join a side room someone opened with us, after checking it really is one. */
+    fun joinSideRoom(name: String, other: String) {
+        val repository = repo ?: return
+        val me = myFingerprint ?: return
+        viewModelScope.launch {
+            try {
+                val room = repository.api.roomByName(name)
+                val ok = room.side?.members?.toSet() == setOf(me, other) && properSide(room)
+                if (!ok) {
+                    toast("This isn't a proper side room, so I didn't join.")
+                    return@launch
+                }
+                joinByName(name)
+            } catch (e: ApiException) {
+                if (e.code == "room_not_found") toast("That side room is gone.")
+                else toast("Couldn't open it: ${e.code} — ${e.message}")
+            } catch (e: Exception) {
+                toast("Couldn't open it: ${e.message}")
+            }
+        }
+    }
+
+    /** Open an existing side room with [other] (its name is derived, so we can just look it up). */
+    fun openSideRoom(other: String) {
+        val me = myFingerprint ?: return
+        joinSideRoom(SideRoom.name(serverOrigin, me, other), other)
+    }
+
+    /** Close the open side room for both people. */
+    fun closeSideRoom() {
+        val repository = repo ?: return
+        val roomId = activeRoomId ?: return
+        viewModelScope.launch {
+            try {
+                repository.api.closeRoom(roomId)
+                closeRoomInternal()
+                toast("Side room closed.")
+            } catch (e: ApiException) {
+                toast("Couldn't close it: ${e.code} — ${e.message}")
+            } catch (e: Exception) {
+                toast("Couldn't close it: ${e.message}")
+            }
+        }
+    }
+
+    /** Which saved contacts already have a side room with us (looked up by derived name). */
+    fun contactsWithSideRoom(onResult: (Set<String>) -> Unit) {
+        val repository = repo ?: return
+        val me = myFingerprint ?: return
+        viewModelScope.launch {
+            val found = mutableSetOf<String>()
+            for (c in storage.contacts().take(30)) {
+                try {
+                    val room = repository.api.roomByName(SideRoom.name(serverOrigin, me, c.fingerprint))
+                    if (room.side?.members?.toSet() == setOf(me, c.fingerprint)) found += c.fingerprint
+                } catch (_: Exception) { /* none, or not reachable */ }
+            }
+            onResult(found)
+        }
+    }
+
+    // ---- Mentions feed ---------------------------------------------------------
+
+    private suspend fun fetchMentions(after: String?, maxPages: Int): List<Mention> {
+        val repository = repo ?: return emptyList()
+        val all = mutableListOf<Mention>()
+        var cursor = after
+        var pages = 0
+        while (pages < maxPages) {
+            val page = repository.api.mentions(after = cursor, limit = 100)
+            if (page.mentions.isEmpty()) break
+            all += page.mentions
+            val next = page.nextCursor?.takeIf { it.isNotBlank() } ?: page.mentions.last().cursor
+            if (next == null || next == cursor) break
+            cursor = next
+            pages++
+        }
+        return all
+    }
+
+    private fun seenCursor(): String? = storage.mentionsSeenCursor?.takeIf { it != START }
+
+    /** Refresh the unread-mentions badge. The first run silently marks history as seen. */
+    fun pollUnread() {
+        if (repo == null) return
+        viewModelScope.launch {
+            try {
+                if (storage.mentionsSeenCursor == null) {
+                    val all = fetchMentions(null, 20)
+                    storage.mentionsSeenCursor = all.lastOrNull()?.cursor ?: START
+                    _unreadMentions.value = 0
+                } else {
+                    _unreadMentions.value = fetchMentions(seenCursor(), 3).size
+                }
+            } catch (_: Exception) { /* transient */ }
+        }
+    }
+
+    /** Load the feed (newest first) and mark everything as seen. */
+    fun openMentions() {
+        viewModelScope.launch {
+            _mentionsLoading.value = true
+            try {
+                val all = fetchMentions(null, 20)
+                _mentions.value = all.asReversed().take(100)
+                storage.mentionsSeenCursor = all.lastOrNull()?.cursor ?: START
+                _unreadMentions.value = 0
+            } catch (e: Exception) {
+                toast("Couldn't load mentions: ${(e as? ApiException)?.message ?: e.message}")
+            } finally {
+                _mentionsLoading.value = false
+            }
+        }
+    }
+
+    // ---- Operator tools --------------------------------------------------------
+
+    fun updateRoomSettings(settings: JsonObject) {
+        val repository = repo ?: return
+        val roomId = activeRoomId ?: return
+        viewModelScope.launch {
+            try {
+                val updated = repository.api.updateRoom(roomId, settings)
+                roomLock.withLock {
+                    currentRoom = updated.copy(occupants = updated.occupants ?: currentRoom?.occupants)
+                    publish()
+                }
+            } catch (e: ApiException) {
+                toast(operatorError(e))
+            } catch (e: Exception) {
+                toast("Update failed: ${e.message}")
+            }
+        }
+    }
+
+    fun loadRoles(onResult: (List<RoleEntry>) -> Unit) {
+        val repository = repo ?: return
+        val roomId = activeRoomId ?: return
+        viewModelScope.launch {
+            runCatching { repository.api.roles(roomId) }.onSuccess(onResult)
+        }
+    }
+
+    /** Set [role] for [identity], or clear it when [role] is null. */
+    fun setRole(identity: String, role: String?, done: () -> Unit = {}) {
+        val repository = repo ?: return
+        val roomId = activeRoomId ?: return
+        viewModelScope.launch {
+            try {
+                if (role == null) repository.api.clearRole(roomId, identity)
+                else repository.api.setRole(roomId, identity, role)
+                done()
+            } catch (e: ApiException) {
+                toast(operatorError(e))
+            } catch (e: Exception) {
+                toast("Failed: ${e.message}")
+            }
+        }
+    }
+
+    fun kick(identity: String, reason: String?) {
+        val repository = repo ?: return
+        val roomId = activeRoomId ?: return
+        viewModelScope.launch {
+            try {
+                repository.api.kick(roomId, identity, reason)
+            } catch (e: ApiException) {
+                toast(operatorError(e))
+            } catch (e: Exception) {
+                toast("Failed: ${e.message}")
+            }
+        }
+    }
+
+    fun createInvite(uses: Int, expiresIn: Int, onResult: (String) -> Unit) {
+        val repository = repo ?: return
+        val roomId = activeRoomId ?: return
+        viewModelScope.launch {
+            try {
+                onResult(repository.api.createInvite(roomId, uses, expiresIn).code)
+            } catch (e: ApiException) {
+                toast(operatorError(e))
+            } catch (e: Exception) {
+                toast("Failed: ${e.message}")
+            }
+        }
+    }
+
+    private fun operatorError(e: ApiException): String = when (e.code) {
+        "not_operator" -> "You need to be an operator for that."
+        "forbidden" -> "You can't do that to this person."
+        else -> "${e.code}: ${e.message}"
     }
 
     // ---- Composing -------------------------------------------------------------
@@ -464,6 +821,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun saveContact(fingerprint: String, petname: String) = storage.saveContact(fingerprint, petname)
+    fun removeContact(fingerprint: String) = storage.removeContact(fingerprint)
     fun contacts() = storage.contacts()
 
     // ---- Helpers ---------------------------------------------------------------
@@ -489,4 +847,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         data?.let { runCatching { json.decodeFromString<Occupant>(it.toString()) }.getOrNull() }
 
     private fun JsonObject.str(key: String): String? = this[key]?.jsonPrimitive?.contentOrNull
+
+    private companion object {
+        /** Stored when the mentions feed was empty, so we can tell "seen nothing" from "first run". */
+        const val START = "start"
+    }
 }

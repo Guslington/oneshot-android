@@ -4,6 +4,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -95,6 +96,44 @@ class OneShotApi(
     suspend fun leave(roomId: String) {
         postUnit("/v1/rooms/${enc(roomId)}/leave", Unit)
     }
+
+    /** Close a side room, deleting it for both people. Only side rooms can be closed. */
+    suspend fun closeRoom(roomId: String) {
+        postUnit("/v1/rooms/${enc(roomId)}/close", Unit)
+    }
+
+    // ---- Operator actions ------------------------------------------------------
+
+    /** PATCH room settings. [settings] may contain explicit nulls (e.g. retention = forever). */
+    suspend fun updateRoom(roomId: String, settings: JsonObject): Room =
+        decode(
+            execute(
+                request("/v1/rooms/${enc(roomId)}", true)
+                    .patch(settings.toString().toRequestBody(jsonMedia)).build(),
+            ),
+        )
+
+    suspend fun roles(roomId: String): List<RoleEntry> =
+        get<RoleList>("/v1/rooms/${enc(roomId)}/roles", auth = true).roles
+
+    suspend fun setRole(roomId: String, identity: String, role: String) {
+        val body = json.encodeToString(RoleRequest(role))
+        execute(
+            request("/v1/rooms/${enc(roomId)}/roles/${enc(identity)}", true)
+                .put(body.toRequestBody(jsonMedia)).build(),
+        )
+    }
+
+    suspend fun clearRole(roomId: String, identity: String) {
+        deleteUnit("/v1/rooms/${enc(roomId)}/roles/${enc(identity)}")
+    }
+
+    suspend fun kick(roomId: String, identity: String, reason: String?) {
+        postUnit("/v1/rooms/${enc(roomId)}/kick", KickRequest(identity, reason?.ifBlank { null }))
+    }
+
+    suspend fun createInvite(roomId: String, uses: Int, expiresIn: Int): InviteResponse =
+        post("/v1/rooms/${enc(roomId)}/invites", InviteRequest(uses, expiresIn), auth = true)
 
     // ---- Messages --------------------------------------------------------------
 

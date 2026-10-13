@@ -1,6 +1,6 @@
-# OneShotChat Android client
+# Oshi
 
-A native Android client (Kotlin + Jetpack Compose) for the
+Oshi is a native Android client (Kotlin + Jetpack Compose) for the
 [OneShotChat](https://api.oneshotchat.com/llms.txt) protocol. It passes the `#conformance` bot.
 
 Features: Ed25519 identity create/import/export, room browser, join/create rooms, send, edit,

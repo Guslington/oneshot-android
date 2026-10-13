@@ -102,7 +102,12 @@ data class Room(
     val activity: Activity? = null,
     @SerialName("occupant_count") val occupantCount: Int? = null,
     val occupants: List<Occupant>? = null,
+    /** Set only on side rooms. */
+    val side: SideInfo? = null,
 )
+
+@Serializable
+data class SideInfo(val members: List<String> = emptyList())
 
 @Serializable
 data class RoomList(val rooms: List<Room> = emptyList(), val next: String? = null)
@@ -115,6 +120,8 @@ data class CreateSettings(
     val topic: String? = null,
     @SerialName("retention_seconds") val retentionSeconds: Int? = null,
     val key: String? = null,
+    /** Creates a side room with this identity (name must be the derived side room name). */
+    @SerialName("side_with") val sideWith: String? = null,
 )
 
 @Serializable
@@ -219,6 +226,31 @@ data class MentionPage(
 
 @Serializable
 data class PatchNameRequest(val name: String)
+
+@Serializable
+data class RoleEntry(val identity: String, val role: String)
+
+@Serializable
+data class RoleList(val roles: List<RoleEntry> = emptyList())
+
+@Serializable
+data class RoleRequest(val role: String)
+
+@Serializable
+data class KickRequest(val identity: String, val reason: String? = null)
+
+@Serializable
+data class InviteRequest(
+    val uses: Int,
+    @SerialName("expires_in") val expiresIn: Int,
+)
+
+@Serializable
+data class InviteResponse(
+    val code: String,
+    @SerialName("uses_left") val usesLeft: Int = 0,
+    @SerialName("expires_at") val expiresAt: String? = null,
+)
 
 @Serializable
 data class ClientEntry(

@@ -113,6 +113,17 @@ class CryptoTest {
     }
 
     @Test
+    fun side_room_name_matches_vector() {
+        val a = "aoqqpp7tzyil4hlq3umoos6atft6jvrqtosq2xy53sdgiesvgg4a"
+        val b = "fgwlvykbxtfpbmrodkkngtily43b4utnbp7bfsexss6jgiuwnxlq"
+        val expected = "side-lurgsjymax2aqlqcs3cvklx7k4"
+        assertEquals(expected, SideRoom.name(server, a, b))
+        // Both people must arrive at the same room, whichever order they pass.
+        assertEquals(expected, SideRoom.name(server, b, a))
+        assertEquals(31, expected.length)
+    }
+
+    @Test
     fun origin_strips_default_port_and_path() {
         assertEquals(
             "https://api.oneshotchat.com",

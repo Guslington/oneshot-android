@@ -1,7 +1,10 @@
 package com.oneshotchat.android.ui
 
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.viewModels
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.Box
@@ -26,6 +29,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.oneshotchat.android.AppState
+import com.oneshotchat.android.notify.Notifications
+import com.oneshotchat.android.ui.screens.ContactsScreen
+import com.oneshotchat.android.ui.screens.CredentialDialog
+import com.oneshotchat.android.ui.screens.MentionsScreen
 import com.oneshotchat.android.ui.screens.RoomBrowserScreen
 import com.oneshotchat.android.ui.screens.RoomScreen
 import com.oneshotchat.android.ui.screens.SettingsScreen
@@ -33,27 +41,70 @@ import com.oneshotchat.android.ui.screens.SetupScreen
 import com.oneshotchat.android.ui.theme.OneShotTheme
 
 class MainActivity : ComponentActivity() {
+    private val vm: ChatViewModel by viewModels()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        handleIntent(intent)
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
         setContent {
             OneShotTheme {
                 AppRoot()
             }
         }
     }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleIntent(intent)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        AppState.foreground = true
+    }
+
+    override fun onStop() {
+        AppState.foreground = false
+        super.onStop()
+    }
+
+    /** A tapped mention notification carries the room to open. */
+    private fun handleIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra(Notifications.EXTRA_MENTIONS, false) == true) {
+            intent.removeExtra(Notifications.EXTRA_MENTIONS)
+            vm.requestMentions()
+            return
+        }
+        val room = intent?.getStringExtra(Notifications.EXTRA_ROOM) ?: return
+        intent.removeExtra(Notifications.EXTRA_ROOM)
+        vm.openRoomByName(room)
+    }
 }
 
-private enum class TopScreen { Browser, Settings }
+private enum class TopScreen { Browser, Settings, Mentions, Contacts }
 
 @Composable
 private fun AppRoot(vm: ChatViewModel = viewModel()) {
     val phase by vm.phase.collectAsStateLifecycle()
     val activeRoom by vm.activeRoom.collectAsStateLifecycle()
     val toast by vm.toast.collectAsStateLifecycle()
+    val prompt by vm.prompt.collectAsStateLifecycle()
+    val showMentions by vm.showMentionsRequest.collectAsStateLifecycle()
 
     val snackbar = remember { SnackbarHostState() }
     var topScreen by remember { mutableStateOf(TopScreen.Browser) }
+
+    // A tapped side-room notification lands on the mentions feed, never straight into a room.
+    LaunchedEffect(showMentions) {
+        if (showMentions) {
+            topScreen = TopScreen.Mentions
+            vm.mentionsRequestHandled()
+        }
+    }
 
     LaunchedEffect(toast) {
         toast?.let {
@@ -80,6 +131,14 @@ private fun AppRoot(vm: ChatViewModel = viewModel()) {
                     val room = activeRoom
                     when {
                         room != null -> RoomScreen(vm = vm, room = room, onBack = vm::closeRoom)
+                        topScreen == TopScreen.Mentions -> MentionsScreen(
+                            vm = vm,
+                            onBack = { topScreen = TopScreen.Browser },
+                        )
+                        topScreen == TopScreen.Contacts -> ContactsScreen(
+                            vm = vm,
+                            onBack = { topScreen = TopScreen.Browser },
+                        )
                         topScreen == TopScreen.Settings -> SettingsScreen(
                             vm = vm,
                             fingerprint = p.fingerprint,
@@ -89,11 +148,24 @@ private fun AppRoot(vm: ChatViewModel = viewModel()) {
                         else -> RoomBrowserScreen(
                             vm = vm,
                             onOpenSettings = { topScreen = TopScreen.Settings },
+                            onOpenMentions = { topScreen = TopScreen.Mentions },
+                            onOpenContacts = { topScreen = TopScreen.Contacts },
                         )
                     }
                 }
             }
         }
+    }
+
+    prompt?.let { p ->
+        CredentialDialog(
+            prompt = p,
+            onSubmit = { value ->
+                if (p.kind == "key") vm.joinByName(p.name, key = value)
+                else vm.joinByName(p.name, invite = value)
+            },
+            onDismiss = vm::dismissPrompt,
+        )
     }
 }
 
